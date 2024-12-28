@@ -5,15 +5,22 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
 #include <vector>
+// proj
+#include "hashtable.h"
 
-static void msg(const char *msg){
+#define container_of(ptr, type, member) ({ \
+    const typeof( ((type *)0)->member ) *__mptr = (ptr); \
+    (type *)( (char *)__mptr - offsetof(type, member) );})
+
+static void msg(const char *msg)
+{
     fprintf(stderr, "%s\n", msg);
 }
 
@@ -73,7 +80,7 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     fd2conn[conn->fd] = conn;
 }
 
-static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
+static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd, int epfd) {
     // accept
     struct sockaddr_in client_addr = {};
     socklen_t socklen = sizeof(client_addr);
@@ -98,12 +105,186 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
     conn->wbuf_size = 0;
     conn->wbuf_sent = 0;
     conn_put(fd2conn, conn);
+
+    // add the client socket to epoll
+    struct epoll_event ev = {};
+    ev.events = EPOLLIN | EPOLLERR;
+    ev.data.fd = connfd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &ev) < 0) {
+        msg("epoll_ctl: add client");
+        close(fd);
+    }
     return 0;
 }
 
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
 
+const size_t k_max_args = 1024;
+
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2, // not exist
+};
+
+
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+// the structure for the key space
+static struct {
+    HMap db;
+} g_data;
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static uint32_t do_get(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen
+) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return RES_NX;
+    }
+
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    memcpy(res, val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+
+    return RES_OK;
+}
+
+static uint32_t do_set(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen
+) {
+    (void)res;
+    (void)reslen;
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (node) {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+
+    return RES_OK;
+}
+
+static uint32_t do_del(
+    std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+    {
+        (void)res;
+        (void)reslen;
+            Entry key;
+        key.key.swap(cmd[1]);
+        key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+        HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
+        if (node) {
+            delete container_of(node, Entry, node);
+        }
+        
+        return RES_OK;
+}
+
+static int32_t parse_req(
+    const uint8_t *data, size_t len, std::vector<std::string> &out)
+    {
+        if (len < 4) {
+            return -1;
+        }
+
+        // get the number of strings
+        uint32_t n = 0;
+        memcpy(&n, &data[0], 4);
+        if (n > k_max_args) {
+            return -1;
+        }
+
+        // start just after the number of strings
+        size_t pos = 4;
+        while (n--) {
+            if (pos + 4 > len) {
+                return -1;
+            }
+            // get the size of the string
+            uint32_t sz = 0;
+            memcpy(&sz, &data[pos], 4);
+            if (pos + 4 + sz > len) {
+                return -1;
+            }
+
+            // save the string in our vector
+            out.push_back(std::string((char *)&data[pos + 4], sz));
+            pos += 4 + sz;
+        }
+
+        if (pos != len) {
+            return -1;
+        }
+        return 0;
+}
+
+static bool cmd_is(const std::string &word, const char *cmd) {
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+static int32_t do_request(
+    const uint8_t *req, uint32_t reqlen,
+    uint32_t *rescode, uint8_t *res, uint32_t *reslen)
+    {
+        std::vector<std::string> cmd;
+        if (0 != parse_req(req, reqlen, cmd)) {
+            msg("bad req");
+            return -1;
+        }
+
+        if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+            *rescode = do_get(cmd, res, reslen);
+        } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+            *rescode = do_set(cmd, res, reslen);
+        } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+            *rescode = do_del(cmd, res, reslen);
+        } else {
+            // command not recognized
+            *rescode = RES_ERR;
+            const char *msg = "Unknown cmd";
+            strcpy((char *)res, msg);
+            *reslen = strlen(msg);
+            return 0;
+        }
+
+        return 0;
+    }
 
 static bool try_one_request(Conn *conn) {
     //try to parse a request from te buffer
@@ -128,15 +309,25 @@ static bool try_one_request(Conn *conn) {
         return false;
     }
 
-    // got one request, do something with it
-    printf("client says: %.*s\n", len, &conn->rbuf[4]);
+    // got one request, generate the response
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(
+        &conn->rbuf[4], len,
+        &rescode, &conn->wbuf[4 + 4], &wlen);
+    
+    if (err) {
+        conn->state = STATE_END;
+        return false;
+    }
 
-    // generating echoing response
-    memcpy(&conn->wbuf[0], &len, 4);
-    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
-    conn->wbuf_size = 4 + len;
+    wlen += 4;
+    // generating response of the length and resocde
+    memcpy(&conn->wbuf[0], &wlen, 4);
+    memcpy(&conn->wbuf[4], &rescode, 4);
+    conn->wbuf_size = 4 + wlen;
 
-    //remove the request from the bugger
+    // remove the request from the buffer
     // frequent memmove is inefficient
     // need better handling for prod code
     size_t remain = conn->rbuf_size - 4 - len;
@@ -278,62 +469,66 @@ int main() {
 
     // map of all client connections
     // keys are fd
-    std::vector<Conn *> fd2conn;
+    std::vector<Conn *> fd2conn(1024, nullptr);
 
     // set the listen fd to nonblocking mode
     fd_set_nb(fd);
 
     // event loop
-    std::vector<struct pollfd> poll_args;
+    int epfd = epoll_create1(0);
+    if (epfd == -1) {
+        die("epoll_create1()");
+    }
+    struct epoll_event ev = {};
+    ev.events = EPOLLIN | EPOLLERR;
+    ev.data.fd = fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        die("epoll_ctl: add listen_fd");
+    }
     
+    // std::cout << fd << std::endl;
+
+    std::vector<struct epoll_event> events(1024);
+
     while (true) {
-        // prepare arguments of the poll()
-        poll_args.clear();
-
-        // for convencience, the listening fd is first
-        struct pollfd pfd = {fd, POLLIN, 0};
-        poll_args.push_back(pfd);
-
-        // connection fds
-        for (Conn *conn : fd2conn) {
-            if (!conn) {
-                continue;
-            }
-            struct pollfd pfd = {};
-            pfd.fd = conn->fd;
-            pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
-            pfd.events = pfd.events | POLLERR;
-            poll_args.push_back(pfd);
+        int n = epoll_wait(epfd, events.data(), events.size(), 1000);
+        if (n < 0) {
+            die("epoll_wait");
         }
 
-        // poll for active fds
-        // timeout arg doesn't matter here
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
-        if (rv < 0) {
-            die("poll");
-        }
+        for (int i = 0; i < n; ++i) {
+            int event_fd = events[i].data.fd;
+            
+            if (event_fd == fd) {
+                // listening socket is read
+                // accept a new connection
+                accept_new_conn(fd2conn, fd, epfd);
+            } else {
+                //existing client socket is ready
+                Conn *conn = fd2conn[event_fd];
+                if (conn) {
+                    connection_io(conn);
 
-        // process active connections
-        for (size_t i = 1; i < poll_args.size(); ++i) {
-            if (poll_args[i].revents) {
-                Conn *conn = fd2conn[poll_args[i].fd];
-                connection_io(conn);
-
-                if (conn->state == STATE_END) {
-                    // client closed normally or something bad happened
-                    // destroy connection
-                    fd2conn[conn->fd] = NULL;
-                    (void)close(conn->fd);
-                    free(conn);
+                    if (conn->state == STATE_END) {
+                        //remove the client from epoll and clean up
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+                        fd2conn[conn->fd] = NULL;
+                        (void)close(conn->fd);
+                        free(conn);
+                    } else {
+                        //update events if needed
+                        struct epoll_event ev = {};
+                        ev.events = (conn->state == STATE_REQ ? EPOLLIN : EPOLLOUT) | EPOLLERR;
+                        ev.data.fd = conn->fd;
+                        epoll_ctl(epfd, EPOLL_CTL_ADD, conn->fd, &ev);
+                    }
                 }
             }
         }
-
-        // try to accept a new connection if the listening fd is active
-        if (poll_args[0].revents) {
-            (void)accept_new_conn(fd2conn, fd);
-        }
     }
+
+    close(fd);
+    close(epfd);
 
     return 0;
 }
